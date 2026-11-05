@@ -153,17 +153,21 @@ fun ChartCard(w: Watch, range: Range, fg: Int, onColors: () -> Unit, onRemove: (
     var series by remember(w.symbol, range) { mutableStateOf<Series?>(null) }
     var err by remember(w.symbol, range) { mutableStateOf<String?>(null) }
     var stamp by remember(w.symbol, range) { mutableStateOf(0L) }
+    var analysis by remember(w.symbol, range) { mutableStateOf<Analysis?>(null) }
     LaunchedEffect(w.symbol, range) {
         while (true) {
             try {
                 series = withContext(Dispatchers.IO) { Api.chart(w.symbol, range) }
                 err = null; stamp = System.currentTimeMillis()
             } catch (e: Exception) { err = "Keine Verbindung oder keine Daten für dieses Symbol" }
+            try {
+                analysis = withContext(Dispatchers.IO) { Analog.ensure(w.symbol, range) }
+            } catch (e: Exception) { }
             delay(60_000)
         }
     }
     val pts = series?.points ?: emptyList()
-    val outlook = remember(series) { Forecast.compute(pts) }
+    val outlook = remember(series, analysis) { analysis?.let { Forecast.fromAnalysis(pts, it) } ?: Forecast.compute(pts) }
     val col = ChartColors(w.price, w.up, w.down, fg, 0)
     val chg = if (pts.size >= 2) pts.last().v / pts.first().v - 1 else 0.0
 
@@ -194,8 +198,18 @@ fun ChartCard(w: Watch, range: Range, fg: Int, onColors: () -> Unit, onRemove: (
         }
         if (outlook != null) {
             Text(outlook.label, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
-            Text(outlook.detail, fontSize = 12.sp)
+            val pu = outlook.pUp
+            if (pu != null) {
+                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp).height(12.dp).clip(RoundedCornerShape(6.dp))) {
+                    Box(Modifier.weight(maxOf(pu.toFloat(), 0.02f)).fillMaxHeight().background(Color(w.up)))
+                    Box(Modifier.weight(maxOf(1f - pu.toFloat(), 0.02f)).fillMaxHeight().background(Color(w.down)))
+                }
+                outlook.lines.forEach { Text(it, fontSize = 12.sp) }
+            } else {
+                Text(outlook.detail, fontSize = 12.sp)
+            }
         }
+        if (analysis == null && series != null) Text("Muster-Analyse der Historie läuft …", fontSize = 11.sp)
         Text(
             "Statistische Szenarien aus vergangenen Kursen. Keine Kaufempfehlung und keine Anlageberatung.",
             fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)

@@ -87,7 +87,10 @@ class ChartWidget : AppWidgetProvider() {
                 fg, withTransparency(bgFull, st.widgetTransp)
             )
             val pts = ser?.points ?: emptyList()
-            val outlook = Forecast.compute(pts)
+            val an = Analog.cached(sym, range)
+            if (!Analog.isFresh(sym, range)) Analog.warm(sym, range) { updateOne(ctx, id) }
+            val outlook = (an?.let { Forecast.fromAnalysis(pts, it) }) ?: Forecast.compute(pts)
+            val badge = outlook?.pUp?.let { String.format(java.util.Locale.GERMANY, "  ↑%.0f %% ↓%.0f %%", it * 100, (1 - it) * 100) } ?: ""
             var right: String? = null; var rc = fg
             if (pts.size >= 2) {
                 val chg = pts.last().v / pts.first().v - 1
@@ -97,7 +100,7 @@ class ChartWidget : AppWidgetProvider() {
             val bmp = Bitmap.createBitmap(wp.toInt().coerceAtLeast(50), hp.toInt().coerceAtLeast(50), Bitmap.Config.ARGB_8888)
             ChartRenderer.draw(
                 Canvas(bmp), bmp.width.toFloat(), bmp.height.toFloat(), d, pts, outlook, col, range,
-                ser?.currency ?: "", title = watch?.name ?: sym, right = right, rightColor = rc, bgCorner = 16f * d
+                ser?.currency ?: "", title = (watch?.name ?: sym) + badge, right = right, rightColor = rc, bgCorner = 16f * d
             )
             val rv = RemoteViews(ctx.packageName, R.layout.widget_chart)
             rv.setImageViewBitmap(R.id.img, bmp)

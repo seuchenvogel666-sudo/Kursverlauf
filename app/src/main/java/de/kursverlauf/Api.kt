@@ -22,8 +22,13 @@ object Api {
     }
 
     /** Kursverlauf (Yahoo-Finance-Chart-Schnittstelle, deckt Aktien, ETFs und Krypto ab). */
-    fun chart(symbol: String, r: Range): Series {
-        val j = JSONObject(get("https://query1.finance.yahoo.com/v8/finance/chart/${enc(symbol)}?range=${r.range}&interval=${r.interval}"))
+    fun chart(symbol: String, r: Range): Series = chartRaw(symbol, r.range, r.interval)
+
+    /** Tageskurse über die gesamte verfügbare Historie (für die Musteranalyse). */
+    fun history(symbol: String): Series = chartRaw(symbol, "max", "1d")
+
+    fun chartRaw(symbol: String, range: String, interval: String): Series {
+        val j = JSONObject(get("https://query1.finance.yahoo.com/v8/finance/chart/${enc(symbol)}?range=$range&interval=$interval"))
         val res = j.getJSONObject("chart").getJSONArray("result").getJSONObject(0)
         val cur = res.optJSONObject("meta")?.optString("currency", "") ?: ""
         val ts = res.optJSONArray("timestamp") ?: return Series(emptyList(), cur)

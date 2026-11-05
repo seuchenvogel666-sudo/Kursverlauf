@@ -72,7 +72,7 @@ object ChartRenderer {
         p.textAlign = Paint.Align.CENTER
         for (k in 0..4) {
             val i = ((total - 1) * k / 4.0).roundToInt()
-            val t = if (i < n) pts[i].t else pts.last().t + (i - n + 1) * dt
+            val t = if (i < n) pts[i].t else (o?.up?.get(i - n + 1)?.t ?: pts.last().t)
             val x = X(i)
             c.drawLine(x, y0, x, y1, grid)
             val label = tf.format(Date(t * 1000))
