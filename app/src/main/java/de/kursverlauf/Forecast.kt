@@ -3,12 +3,41 @@ package de.kursverlauf
 import java.util.Locale
 import kotlin.math.*
 
+/**
+ * tendency: Einordnung (Positiv ... Negativ), recommendation: Abwarten / Kaufen / Verkaufen,
+ * signal: 0 = klar Verkaufen ... 1 = klar Kaufen, info: Überschrift + Informationszeile.
+ */
 class Outlook(
-    val up: List<Point>, val down: List<Point>, val label: String, val detail: String, val score: Int,
-    val pUp: Double? = null, val lines: List<String> = emptyList()
+    val up: List<Point>, val down: List<Point>,
+    val tendency: String, val recommendation: String,
+    val signal: Double, val signalNote: String,
+    val info: List<Pair<String, String>>,
+    val pUp: Double? = null,
+    val mid: List<Point>? = null
 )
 
 object Forecast {
+    private fun pc(v: Double) = String.format(Locale.GERMANY, "%+.1f %%", v * 100)
+
+    private fun tendencyOf(p: Double) = when {
+        p >= 0.65 -> "Positiv"
+        p >= 0.55 -> "Eher positiv"
+        p > 0.45 -> "Neutral"
+        p > 0.35 -> "Eher negativ"
+        else -> "Negativ"
+    }
+
+    private fun recommendationOf(signal: Double) = when {
+        signal >= 0.60 -> "Kaufen"
+        signal <= 0.40 -> "Verkaufen"
+        else -> "Abwarten"
+    }
+
+    private fun noteOf(signal: Double, extra: String = ""): String {
+        val strength = abs(signal - 0.5) * 2 * 100
+        val dir = if (signal >= 0.5) "Richtung Kaufen" else "Richtung Verkaufen"
+        return String.format(Locale.GERMANY, "Signalstärke %.0f %% (%s)%s", strength, dir, extra)
+    }
 
     /** Einfache Variante (Fallback, solange die Historie noch nicht analysiert ist). */
     fun compute(p: List<Point>): Outlook? {
@@ -34,17 +63,18 @@ object Forecast {
         val rsiScore = when { rsi < 30 -> 1; rsi > 70 -> -1; else -> 0 }
         val mom = last.v / p[n - 1 - s].v - 1.0
         val score = trend + rsiScore + (if (mom > 0) 1 else -1)
-        val label = when {
-            score >= 2 -> "Tendenz: eher Kauf-Chance"
-            score <= -2 -> "Tendenz: eher Verkaufs-Risiko"
-            else -> "Tendenz: neutral, abwarten"
+        val signal = (score + 3) / 6.0
+        val tendency = when {
+            score >= 3 -> "Positiv"; score == 2 -> "Eher positiv"
+            score <= -3 -> "Negativ"; score == -2 -> "Eher negativ"
+            else -> "Neutral"
         }
-        val detail = String.format(
-            Locale.GERMANY,
-            "Einfache Schätzung (Historie wird noch analysiert) · Trend %s · RSI %.0f · Momentum %+.1f %%",
-            if (trend > 0) "aufwärts" else "abwärts", rsi, mom * 100
+        val info = listOf(
+            "Basis" to "Einfache Schätzung aus dem sichtbaren Verlauf (Trend, RSI, Momentum). Die Musteranalyse der Historie fehlt noch.",
+            "Kennwerte" to String.format(Locale.GERMANY, "Trend %s · RSI %.0f · Momentum %s", if (trend > 0) "aufwärts" else "abwärts", rsi, pc(mom))
         )
-        return Outlook(up, down, label, detail, score)
+        val mid = (0..h).map { k -> Point(last.t + k * dt, last.v * exp(mu * k)) }
+        return Outlook(up, down, tendency, recommendationOf(signal), signal, noteOf(signal), info, null, mid)
     }
 
     /** Prognose aus der Musteranalyse: Szenarien und Prozentwerte stammen aus ähnlichen historischen Verläufen. */
@@ -65,28 +95,23 @@ object Forecast {
         val up = (0..h).map { i -> Point(last.t + span * i / h, last.v * (1 + at(a.upRel, i))) }
         val down = (0..h).map { i -> Point(last.t + span * i / h, last.v * (1 + at(a.downRel, i))) }
 
-        val pctUp = a.pUp * 100
-        val weak = a.hitRate < 0 || a.hitRate < 0.53
-        val base = when {
-            a.pUp >= 0.60 -> "Tendenz: eher Kauf-Chance"
-            a.pUp <= 0.40 -> "Tendenz: eher Verkaufs-Risiko"
-            else -> "Tendenz: neutral, abwarten"
-        }
-        val label = base + if (a.hitRate < 0) " (Aussagekraft unbekannt)" else if (weak) " (geringe Aussagekraft)" else ""
+        // Empfehlung: Wahrscheinlichkeit wird bei schwacher Trefferquote Richtung 50 % gezogen
+        val f = if (a.hitRate < 0) 0.5 else ((a.hitRate - 0.5) / 0.08).coerceIn(0.25, 1.0)
+        val signal = 0.5 + (a.pUp - 0.5) * f
+        val weakNote = if (a.hitRate < 0.53) " · abgeschwächt wegen geringer Trefferquote" else ""
 
-        fun pc(v: Double) = String.format(Locale.GERMANY, "%+.1f %%", v * 100)
-        val lines = ArrayList<String>()
-        lines.add(String.format(Locale.GERMANY, "Steigend %.0f %% · Fallend %.0f %% (Anteil ähnlicher Verläufe, die danach stiegen bzw. fielen)", pctUp, 100 - pctUp))
-        lines.add(String.format(Locale.GERMANY, "Basis: %d ähnliche Verläufe aus %.0f Jahren Historie, Horizont %d Tage", a.analogs, a.years, a.horizonDays))
-        lines.add(
-            if (a.hitRate >= 0)
-                String.format(Locale.GERMANY, "Trefferquote dieser Methode bei diesem Wert: %.0f %% (%d Rückwärts-Tests, Zufall wäre 50 %%)", a.hitRate * 100, a.tests)
-            else "Trefferquote: zu wenig Historie für einen Rückwärts-Test"
+        val pctUp = a.pUp * 100
+        val info = listOf(
+            "Steigend / Fallend" to String.format(Locale.GERMANY, "%.0f %% / %.0f %% der ähnlichen Verläufe stiegen bzw. fielen danach", pctUp, 100 - pctUp),
+            "Basis" to String.format(Locale.GERMANY, "%d ähnliche Verläufe aus %.0f Jahren Historie, Horizont %d Tage", a.analogs, a.years, a.horizonDays),
+            "Trefferquote" to (
+                if (a.hitRate >= 0)
+                    String.format(Locale.GERMANY, "%.0f %% bei diesem Wert (%d Rückwärts-Tests, Zufall wäre 50 %%)", a.hitRate * 100, a.tests)
+                else "Zu wenig Historie für einen Rückwärts-Test"),
+            "Spanne am Ende" to (pc(a.upRel.last()) + " / " + pc(a.downRel.last()) + " (Median " + pc(a.medRel.last()) + ")"),
+            "Verlustrisiko" to String.format(Locale.GERMANY, "Verlust über %.0f %%: %.0f %%", a.lossThr * 100, a.pLoss * 100)
         )
-        lines.add(
-            "Spanne am Ende: " + pc(a.upRel.last()) + " / " + pc(a.downRel.last()) + " (Median " + pc(a.medRel.last()) + ")" +
-                String.format(Locale.GERMANY, " · Verlust über %.0f %%: %.0f %%", a.lossThr * 100, a.pLoss * 100)
-        )
-        return Outlook(up, down, label, lines.joinToString("\n"), 0, a.pUp, lines)
+        val mid = (0..h).map { i -> Point(last.t + span * i / h, last.v * (1 + at(a.medRel, i))) }
+        return Outlook(up, down, tendencyOf(a.pUp), recommendationOf(signal), signal, noteOf(signal, weakNote), info, a.pUp, mid)
     }
 }

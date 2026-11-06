@@ -2,6 +2,8 @@ package de.kursverlauf
 
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
+import java.util.concurrent.Executors
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlin.math.*
 
 /** Ergebnis der Musteranalyse. Alle Werte relativ zum aktuellen Kurs (0.05 = +5 %). */
@@ -27,6 +29,11 @@ object Analog {
     private class Entry(val a: Analysis, val ts: Long)
     private class Hist(val c: DoubleArray, val years: Double, val ts: Long)
     private class Pred(val up: DoubleArray?, val down: DoubleArray?, val med: DoubleArray?, val pUp: Double, val pLoss: Double, val n: Int)
+
+    /** Eigener Thread mit niedriger Priorität: die Rechnung bremst das Scrollen nicht. */
+    val dispatcher = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "analyse").apply { priority = Thread.MIN_PRIORITY; isDaemon = true }
+    }.asCoroutineDispatcher()
 
     private val cache = ConcurrentHashMap<String, Entry>()
     private val hist = ConcurrentHashMap<String, Hist>()
@@ -56,22 +63,25 @@ object Analog {
     }
 
     /** Blockierend: Historie laden, analysieren, Ergebnis eine Stunde zwischenspeichern. */
-    fun ensure(sym: String, r: Range): Analysis? {
+    fun ensure(sym: String, r: Range, onProgress: (Int) -> Unit = {}): Analysis? {
         val k = key(sym, r)
         val now = System.currentTimeMillis()
         cache[k]?.let { if (now - it.ts < FRESH_MS) return it.a }
+        onProgress(0)
         val h = hist[sym]?.takeIf { now - it.ts < 6 * FRESH_MS } ?: run {
             val s = Api.history(sym).points.filter { it.v > 0 }.takeLast(MAX_BARS)
             if (s.size < 2) return null
             val years = (s.last().t - s.first().t) / 31_557_600.0
             Hist(DoubleArray(s.size) { s[it].v }, years, now).also { hist[sym] = it }
         }
-        val a = analyze(h.c, h.years, r) ?: return null
+        onProgress(10)
+        val a = analyze(h.c, h.years, r, onProgress) ?: return null
         cache[k] = Entry(a, now)
+        onProgress(100)
         return a
     }
 
-    private fun analyze(c: DoubleArray, years: Double, r: Range): Analysis? {
+    private fun analyze(c: DoubleArray, years: Double, r: Range, onProgress: (Int) -> Unit): Analysis? {
         val (L, H, thr) = cfg(r)
         val m = c.size
         if (m < L + H + 250) return null
@@ -79,10 +89,15 @@ object Analog {
         val now = m - 1
         val cur = predict(lc, now, L, H, thr, true) ?: return null
 
-        var tests = 0; var hits = 0
+        onProgress(20)
+        var tests = 0; var hits = 0; var iter = 0
         val step = max(H, 5)
         var t = now - H
-        while (tests < 60 && t >= 150 + max(H, L) + L) {
+        val minT = 150 + max(H, L) + L
+        val planned = if (t >= minT) min(60, (t - minT) / step + 1) else 1
+        while (iter < 60 && t >= minT) {
+            iter++
+            onProgress(20 + 80 * iter / planned)
             val pr = predict(lc, t, L, H, thr, false)
             if (pr != null) {
                 val predUp = pr.pUp >= 0.5
@@ -136,11 +151,15 @@ object Analog {
             for (j in 0 until L) { val x = z[j] - q[j]; d += x * x }
             dist[i] = d / L
         }
-        val order = (0 until cnt).sortedBy { dist[it] }
         val minGap = max(3, L / 2)
         val pick = ArrayList<Int>()   // Index i = Beginn des Fensters
-        for (i in order) {
-            if (pick.none { abs(it - i) < minGap }) { pick.add(i); if (pick.size >= K) break }
+        val blocked = BooleanArray(cnt)
+        while (pick.size < K) {
+            var best = -1; var bd = Double.MAX_VALUE
+            for (i in 0 until cnt) if (!blocked[i] && dist[i] < bd) { bd = dist[i]; best = i }
+            if (best < 0) break
+            pick.add(best)
+            for (j in max(0, best - minGap + 1)..min(cnt - 1, best + minGap - 1)) blocked[j] = true
         }
         if (pick.size < 8) return null
 

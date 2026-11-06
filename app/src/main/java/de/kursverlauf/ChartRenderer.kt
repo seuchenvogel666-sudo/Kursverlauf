@@ -6,7 +6,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.*
 
-class ChartColors(val price: Int, val up: Int, val down: Int, val text: Int, val bg: Int)
+class ChartColors(val price: Int, val up: Int, val down: Int, val text: Int, val bg: Int, val mid: Int = Pal.MID)
 
 /** Zeichnet den Graphen auf ein android.graphics.Canvas (App und Widget nutzen denselben Code). */
 object ChartRenderer {
@@ -104,6 +104,11 @@ object ChartRenderer {
             }
             ln.color = col.up; c.drawPath(path(o.up), ln)
             ln.color = col.down; c.drawPath(path(o.down), ln)
+            o.mid?.let { mp ->
+                ln.color = col.mid; ln.strokeWidth = 2.5f * d
+                ln.pathEffect = DashPathEffect(floatArrayOf(3f * d, 4f * d), 0f)
+                c.drawPath(path(mp), ln)
+            }
             val xv = X(n - 1)
             val dv = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = col.text; alpha = 90; strokeWidth = 1f; pathEffect = DashPathEffect(floatArrayOf(4f * d, 4f * d), 0f) }
             c.drawLine(xv, y0, xv, y1, dv)

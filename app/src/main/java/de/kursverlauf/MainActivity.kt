@@ -7,6 +7,9 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -14,12 +17,19 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.positionInWindow
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
@@ -70,36 +80,28 @@ fun App(store: Store) {
             Box(Modifier.fillMaxSize().background(Color(withTransparency(appBg, appTr))).systemBarsPadding().padding(horizontal = 12.dp)) {
                 when (screen) {
                     Screen.HOME -> Home(
-                        watch, range, fg,
+                        watch, range, 
                         onRange = { range = it; store.range = it },
                         onSearch = { screen = Screen.SEARCH },
                         onSettings = { screen = Screen.SETTINGS },
-                        onColors = { w ->
-                            picker = PickerReq("Farbe Verlauf: ${w.name}", w.price) { c ->
-                                saveWatch(watch.map { if (it.symbol == w.symbol) it.copy(price = c) else it })
-                            }
-                        },
-                        onRemove = { w -> saveWatch(watch.filter { it.symbol != w.symbol }) }
+                        onRemove = { w -> saveWatch(watch.filter { it.symbol != w.symbol }) },
+                        onMove = { a, b -> val l = watch.toMutableList(); l.add(b, l.removeAt(a)); saveWatch(l) }
                     )
                     Screen.SEARCH -> Search(fg, onBack = { screen = Screen.HOME }) { q ->
-                        if (watch.none { it.symbol == q.symbol }) saveWatch(watch + store.newWatch(q))
+                        if (watch.none { it.symbol == q.symbol }) saveWatch(watch + Watch(q.symbol, q.name))
                         screen = Screen.HOME
                     }
                     Screen.SETTINGS -> Settings(
-                        watch, appBg, appTr, wBg, wTr, store.themeIdx,
-                        onTheme = { i ->
-                            val t = Themes.all[i]
-                            store.themeIdx = i
-                            appBg = t.bg; store.appBg = t.bg
-                            wBg = t.bg; store.widgetBg = t.bg
-                            saveWatch(watch.map { it.copy(price = t.price, up = t.up, down = t.down) })
-                        },
+                        appBg, appTr, wBg, wTr,
                         onAppTr = { appTr = it; store.appTransp = it },
                         onWTr = { wTr = it; store.widgetTransp = it },
                         pick = { picker = it },
                         onAppBg = { appBg = it; store.appBg = it },
                         onWBg = { wBg = it; store.widgetBg = it },
-                        onWatch = { saveWatch(it) },
+                        onReset = {
+                            appBg = Pal.BG; store.appBg = Pal.BG; appTr = 0; store.appTransp = 0
+                            wBg = Pal.BG; store.widgetBg = Pal.BG; wTr = 15; store.widgetTransp = 15
+                        },
                         onBack = { closeSettings() }
                     )
                 }
@@ -123,57 +125,153 @@ fun Chip(text: String, selected: Boolean, onClick: () -> Unit) {
 
 @Composable
 fun Home(
-    watch: List<Watch>, range: Range, fg: Int,
+    watch: List<Watch>, range: Range,
     onRange: (Range) -> Unit, onSearch: () -> Unit, onSettings: () -> Unit,
-    onColors: (Watch) -> Unit, onRemove: (Watch) -> Unit
+    onRemove: (Watch) -> Unit, onMove: (Int, Int) -> Unit
 ) {
+    val scroll = rememberScrollState()
+    val curWatch by rememberUpdatedState(watch)
+    val curMove by rememberUpdatedState(onMove)
+    val heights = remember { HashMap<String, Int>() }
+    var dragKey by remember { mutableStateOf<String?>(null) }
+    var dragOffset by remember { mutableStateOf(0f) }
+    var pointerY by remember { mutableStateOf(0f) }
+    var viewTop by remember { mutableStateOf(0f) }
+    var viewBottom by remember { mutableStateOf(0f) }
+    val edge = LocalDensity.current.density * 90f
+
+    fun maybeSwap() {
+        val dk = dragKey ?: return
+        val l = curWatch
+        val i = l.indexOfFirst { it.symbol == dk }
+        if (i < 0) return
+        val hs = heights[dk] ?: return
+        if (dragOffset > 0 && i < l.lastIndex) {
+            val hn = heights[l[i + 1].symbol] ?: return
+            if (dragOffset > (hs + hn) / 2f) { curMove(i, i + 1); dragOffset -= hn }
+        } else if (dragOffset < 0 && i > 0) {
+            val hp = heights[l[i - 1].symbol] ?: return
+            if (dragOffset < -(hs + hp) / 2f) { curMove(i, i - 1); dragOffset += hp }
+        }
+    }
+
+    // automatisches Scrollen, wenn man beim Ziehen an den oberen/unteren Rand kommt
+    LaunchedEffect(dragKey) {
+        if (dragKey == null) return@LaunchedEffect
+        while (true) {
+            val d = when { pointerY < viewTop + edge -> -16f; pointerY > viewBottom - edge -> 16f; else -> 0f }
+            if (d != 0f) { val used = scroll.scrollBy(d); dragOffset += used; maybeSwap() }
+            delay(16)
+        }
+    }
+
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Kursverlauf", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
             TextButton(onClick = onSearch) { Text("＋ Suchen") }
             TextButton(onClick = onSettings) { Text("⚙ Einstellungen") }
         }
-        Row(Modifier.fillMaxWidth().horizontalScrollCompat(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Range.values().forEach { Chip(it.short, it == range) { onRange(it) } }
         }
-        Spacer(Modifier.height(8.dp))
+        Text("Lange auf einen Graphen drücken und ziehen, um die Reihenfolge zu ändern.", fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp, bottom = 4.dp))
         if (watch.isEmpty()) Text("Noch keine Graphen. Oben auf „Suchen“ tippen.", Modifier.padding(16.dp))
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(watch, key = { it.symbol }) { w -> ChartCard(w, range, fg, { onColors(w) }, { onRemove(w) }) }
+        Box(
+            Modifier.weight(1f).fillMaxWidth()
+                .onGloballyPositioned { val b = it.boundsInWindow(); viewTop = b.top; viewBottom = b.bottom }
+        ) {
+            Column(Modifier.fillMaxSize().verticalScroll(scroll, enabled = dragKey == null)) {
+                watch.forEach { w ->
+                    key(w.symbol) {
+                        val dragging = dragKey == w.symbol
+                        var topInWindow by remember { mutableStateOf(0f) }
+                        Box(
+                            Modifier.zIndex(if (dragging) 1f else 0f)
+                                .graphicsLayer {
+                                    if (dragging) { translationY = dragOffset; scaleX = 1.02f; scaleY = 1.02f; alpha = 0.93f }
+                                }
+                                .onSizeChanged { heights[w.symbol] = it.height }
+                                .onGloballyPositioned { topInWindow = it.positionInWindow().y }
+                                .pointerInput(w.symbol) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = { off -> dragKey = w.symbol; dragOffset = 0f; pointerY = topInWindow + off.y },
+                                        onDrag = { change, amount ->
+                                            change.consume()
+                                            dragOffset += amount.y; pointerY += amount.y
+                                            maybeSwap()
+                                        },
+                                        onDragEnd = { dragKey = null; dragOffset = 0f },
+                                        onDragCancel = { dragKey = null; dragOffset = 0f }
+                                    )
+                                }
+                        ) { ChartCard(w, range) { onRemove(w) } }
+                    }
+                }
+                Spacer(Modifier.height(24.dp))
+            }
         }
     }
 }
 
-// einfache horizontale Scroll-Zeile ohne Zusatzabhängigkeit
+/** Überschrift (fett) mit Informationszeile darunter. */
 @Composable
-private fun Modifier.horizontalScrollCompat(): Modifier = this.then(Modifier.horizontalScroll(rememberScrollState()))
+fun InfoBlock(heading: String, text: String) {
+    Column(Modifier.padding(top = 10.dp)) {
+        Text(heading, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        Text(text, fontSize = 12.sp, modifier = Modifier.padding(top = 1.dp))
+    }
+}
+
+/** Eigene Komposition, damit nur dieser Teil bei Fortschrittsänderungen neu gezeichnet wird. */
+@Composable
+fun AnalysisProgress(progress: () -> Int) {
+    val p = progress()
+    Column(Modifier.padding(top = 10.dp)) {
+        Text("Muster-Analyse der Historie läuft … $p %", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+        LinearProgressIndicator(
+            progress = { p / 100f },
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+            color = Color(Pal.PRICE), trackColor = Color(WHITE).copy(alpha = 0.15f)
+        )
+    }
+}
+
+/** Zwischenspeicher: beim Zurückkehren oder Scrollen erscheinen die Daten sofort, nichts springt. */
+object Live { val series = HashMap<String, Series>() }
 
 @Composable
-fun ChartCard(w: Watch, range: Range, fg: Int, onColors: () -> Unit, onRemove: () -> Unit) {
-    var series by remember(w.symbol, range) { mutableStateOf<Series?>(null) }
-    var err by remember(w.symbol, range) { mutableStateOf<String?>(null) }
-    var stamp by remember(w.symbol, range) { mutableStateOf(0L) }
-    var analysis by remember(w.symbol, range) { mutableStateOf<Analysis?>(null) }
-    LaunchedEffect(w.symbol, range) {
+fun ChartCard(w: Watch, range: Range, onRemove: () -> Unit) {
+    val ck = w.symbol + "|" + range.name
+    var series by remember(ck) { mutableStateOf(Live.series[ck]) }
+    var err by remember(ck) { mutableStateOf<String?>(null) }
+    var stamp by remember(ck) { mutableStateOf(0L) }
+    var analysis by remember(ck) { mutableStateOf(Analog.cached(w.symbol, range)) }
+    var progress by remember(ck) { mutableStateOf(0) }
+    var tried by remember(ck) { mutableStateOf(Analog.cached(w.symbol, range) != null) }
+    LaunchedEffect(ck) {
         while (true) {
             try {
-                series = withContext(Dispatchers.IO) { Api.chart(w.symbol, range) }
-                err = null; stamp = System.currentTimeMillis()
+                val s = withContext(Dispatchers.IO) { Api.chart(w.symbol, range) }
+                Live.series[ck] = s
+                series = s; err = null; stamp = System.currentTimeMillis()
             } catch (e: Exception) { err = "Keine Verbindung oder keine Daten für dieses Symbol" }
             try {
-                analysis = withContext(Dispatchers.IO) { Analog.ensure(w.symbol, range) }
+                val a = withContext(Analog.dispatcher) { Analog.ensure(w.symbol, range) { p -> progress = p } }
+                if (a != null) analysis = a
             } catch (e: Exception) { }
+            tried = true
             delay(60_000)
         }
     }
-    val pts = series?.points ?: emptyList()
+    val pts = remember(series) { series?.points ?: emptyList() }
     val outlook = remember(series, analysis) { analysis?.let { Forecast.fromAnalysis(pts, it) } ?: Forecast.compute(pts) }
-    val col = ChartColors(w.price, w.up, w.down, fg, 0)
+    val pattern = remember(series) { Patterns.detect(pts) }
+    val col = ChartColors(Pal.PRICE, Pal.UP, Pal.DOWN, WHITE, 0)
     val chg = if (pts.size >= 2) pts.last().v / pts.first().v - 1 else 0.0
 
     Column(
         Modifier.fillMaxWidth().padding(vertical = 6.dp).clip(RoundedCornerShape(16.dp))
-            .background(Color(fg).copy(alpha = 0.08f)).padding(12.dp)
+            .background(LocalContentColor.current.copy(alpha = 0.08f)).padding(12.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
@@ -182,44 +280,71 @@ fun ChartCard(w: Watch, range: Range, fg: Int, onColors: () -> Unit, onRemove: (
             }
             if (pts.size >= 2) Column(horizontalAlignment = Alignment.End) {
                 Text(ChartRenderer.fmt(pts.last().v) + " " + (series?.currency ?: ""), fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Text(String.format(Locale.GERMANY, "%+.2f %%", chg * 100), color = Color(if (chg >= 0) w.up else w.down), fontSize = 13.sp)
+                Text(String.format(Locale.GERMANY, "%+.2f %%", chg * 100), color = Color(if (chg >= 0) Pal.UP else Pal.DOWN), fontSize = 13.sp)
             }
         }
         Spacer(Modifier.height(8.dp))
         if (series == null) {
-            Text(err ?: "Lade Daten …", Modifier.padding(vertical = 40.dp))
+            Box(Modifier.fillMaxWidth().height(240.dp), contentAlignment = Alignment.Center) { Text(err ?: "Lade Daten …") }
         } else {
             Canvas(Modifier.fillMaxWidth().height(240.dp)) {
                 drawIntoCanvas { ChartRenderer.draw(it.nativeCanvas, size.width, size.height, density, pts, outlook, col, range, series?.currency ?: "") }
             }
         }
-        Row(Modifier.padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-            Legend("Verlauf", w.price); Legend("Positiv-Szenario", w.up); Legend("Negativ-Szenario", w.down)
+        Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) { Legend("Verlauf", Pal.PRICE); Legend("Erwarteter Verlauf (gestrichelt)", Pal.MID) }
+            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) { Legend("Positiv-Szenario", Pal.UP); Legend("Negativ-Szenario", Pal.DOWN) }
         }
-        if (outlook != null) {
-            Text(outlook.label, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
-            val pu = outlook.pUp
-            if (pu != null) {
-                Row(Modifier.fillMaxWidth().padding(vertical = 6.dp).height(12.dp).clip(RoundedCornerShape(6.dp))) {
-                    Box(Modifier.weight(maxOf(pu.toFloat(), 0.02f)).fillMaxHeight().background(Color(w.up)))
-                    Box(Modifier.weight(maxOf(1f - pu.toFloat(), 0.02f)).fillMaxHeight().background(Color(w.down)))
-                }
-                outlook.lines.forEach { Text(it, fontSize = 12.sp) }
-            } else {
-                Text(outlook.detail, fontSize = 12.sp)
+
+        if (pattern != null) {
+            Column(Modifier.padding(top = 12.dp)) {
+                Text("Aktuelles Chartmuster", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(pattern.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, color = Color(Pal.MID))
+                Text(pattern.meaning, fontSize = 12.sp)
             }
         }
-        if (analysis == null && series != null) Text("Muster-Analyse der Historie läuft …", fontSize = 11.sp)
+
+        if (series != null && analysis == null) {
+            if (!tried) AnalysisProgress { progress }
+            else Text("Für die Musteranalyse fehlt Historie, es wird eine einfache Schätzung angezeigt.", fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+        }
+
+        if (outlook != null) {
+            val tcol = when {
+                outlook.tendency.contains("ositiv") -> Color(Pal.UP)
+                outlook.tendency.contains("egativ") -> Color(Pal.DOWN)
+                else -> Color(WHITE)
+            }
+            Column(Modifier.padding(top = 12.dp)) {
+                Text("Tendenz", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(outlook.tendency, color = tcol, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+            }
+            Column(Modifier.padding(top = 12.dp)) {
+                Text("Empfehlung (statistisch, keine Anlageberatung)", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(outlook.recommendation, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                Box(
+                    Modifier.fillMaxWidth().padding(top = 6.dp).height(12.dp).clip(RoundedCornerShape(6.dp)).background(Color(Pal.DOWN))
+                ) {
+                    Box(Modifier.fillMaxWidth(outlook.signal.toFloat().coerceIn(0f, 1f)).fillMaxHeight().background(Color(Pal.UP)))
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 2.dp)) {
+                    Text("Verkaufen", fontSize = 11.sp, modifier = Modifier.weight(1f))
+                    Text("Kaufen", fontSize = 11.sp)
+                }
+                Text(outlook.signalNote, fontSize = 11.sp)
+            }
+            outlook.info.forEach { (h, t) -> InfoBlock(h, t) }
+        }
+
         Text(
             "Statistische Szenarien aus vergangenen Kursen. Keine Kaufempfehlung und keine Anlageberatung.",
-            fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)
+            fontSize = 11.sp, modifier = Modifier.padding(top = 12.dp)
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 if (stamp > 0) "Stand " + SimpleDateFormat("HH:mm:ss", Locale.GERMANY).format(Date(stamp)) + (err?.let { " · $it" } ?: "") else "",
                 fontSize = 11.sp, modifier = Modifier.weight(1f)
             )
-            TextButton(onClick = onColors) { Text("Farbe") }
             TextButton(onClick = onRemove) { Text("Entfernen") }
         }
     }
@@ -286,37 +411,17 @@ fun Swatch(color: Int, label: String, onClick: () -> Unit) {
 
 @Composable
 fun Settings(
-    watch: List<Watch>, appBg: Int, appTr: Int, wBg: Int, wTr: Int, themeIdx: Int,
-    onTheme: (Int) -> Unit, onAppTr: (Int) -> Unit, onWTr: (Int) -> Unit,
+    appBg: Int, appTr: Int, wBg: Int, wTr: Int,
+    onAppTr: (Int) -> Unit, onWTr: (Int) -> Unit,
     pick: (PickerReq) -> Unit, onAppBg: (Int) -> Unit, onWBg: (Int) -> Unit,
-    onWatch: (List<Watch>) -> Unit, onBack: () -> Unit
+    onReset: () -> Unit, onBack: () -> Unit
 ) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 8.dp)) {
             TextButton(onClick = onBack) { Text("← Zurück") }
             Text("Einstellungen", fontWeight = FontWeight.Bold, fontSize = 18.sp)
         }
-        Text("Design-Vorlagen (setzt Farben aller Graphen und Hintergründe)", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
-        Themes.all.forEachIndexed { i, t ->
-            Row(
-                Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
-                    .background(if (i == themeIdx) LocalContentColor.current.copy(alpha = 0.15f) else Color.Transparent)
-                    .clickable { onTheme(i) }.padding(8.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(Modifier.size(34.dp).clip(RoundedCornerShape(8.dp)).background(Color(t.bg)), contentAlignment = Alignment.Center) {
-                    Box(Modifier.size(14.dp).clip(CircleShape).background(Color(t.price)))
-                }
-                Spacer(Modifier.width(4.dp))
-                Box(Modifier.size(10.dp).clip(CircleShape).background(Color(t.up)))
-                Spacer(Modifier.width(3.dp))
-                Box(Modifier.size(10.dp).clip(CircleShape).background(Color(t.down)))
-                Spacer(Modifier.width(10.dp))
-                Column { Text("${i + 1}. ${t.name}", fontWeight = FontWeight.Bold); Text(t.desc, fontSize = 12.sp) }
-            }
-        }
-
-        Text("App-Hintergrund", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 16.dp))
+        Text("App-Hintergrund", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
         Swatch(appBg, "Farbe wählen") { pick(PickerReq("App-Hintergrund", appBg, onAppBg)) }
         Text("Durchsichtigkeit: $appTr %  (0 = deckend, 100 = durchsichtig)", fontSize = 13.sp)
         Slider(appTr.toFloat(), { onAppTr(it.toInt()) }, valueRange = 0f..100f)
@@ -326,15 +431,8 @@ fun Settings(
         Text("Durchsichtigkeit: $wTr %  (0 = deckend, 100 = durchsichtig)", fontSize = 13.sp)
         Slider(wTr.toFloat(), { onWTr(it.toInt()) }, valueRange = 0f..100f)
 
-        Text("Farben je Graph", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
-        watch.forEach { w ->
-            Text(w.name + "  (" + w.symbol + ")", modifier = Modifier.padding(top = 8.dp), maxLines = 1)
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                Swatch(w.price, "Verlauf") { pick(PickerReq("Verlauf: ${w.name}", w.price) { c -> onWatch(watch.map { if (it.symbol == w.symbol) it.copy(price = c) else it }) }) }
-                Swatch(w.up, "Positiv") { pick(PickerReq("Positiv: ${w.name}", w.up) { c -> onWatch(watch.map { if (it.symbol == w.symbol) it.copy(up = c) else it }) }) }
-                Swatch(w.down, "Negativ") { pick(PickerReq("Negativ: ${w.name}", w.down) { c -> onWatch(watch.map { if (it.symbol == w.symbol) it.copy(down = c) else it }) }) }
-            }
-        }
+        TextButton(onClick = onReset, modifier = Modifier.padding(top = 8.dp)) { Text("Auf Nachtblau zurücksetzen") }
+        Text("Graphfarben sind fest: Verlauf blau, Positiv-Szenario grün, Negativ-Szenario rot.", fontSize = 12.sp, modifier = Modifier.padding(top = 8.dp))
         Spacer(Modifier.height(40.dp))
     }
 }
