@@ -1,24 +1,29 @@
 package de.kursverlauf
 
 import java.util.concurrent.ConcurrentHashMap
-import kotlin.concurrent.thread
 import java.util.concurrent.Executors
-import kotlinx.coroutines.asCoroutineDispatcher
+import kotlin.concurrent.thread
 import kotlin.math.*
+import kotlinx.coroutines.asCoroutineDispatcher
 
-/** Ergebnis der Musteranalyse. Alle Werte relativ zum aktuellen Kurs (0.05 = +5 %). */
+/** Angaben zur gelesenen Historie: Anzahl Kurse, Zeitraum (Unix-Sekunden), Lesezeitpunkt (ms). */
+class HistMeta(val bars: Int, val from: Long, val to: Long, val loadedAt: Long, val hourly: Boolean)
+
+/** Ergebnis der Musteranalyse. Alle Kurswerte relativ zum aktuellen Kurs (0.05 = +5 %). */
 class Analysis(
     val upRel: DoubleArray, val downRel: DoubleArray, val medRel: DoubleArray,
-    val horizonDays: Int, val lossThr: Double,
-    val pUp: Double, val pLoss: Double,
-    val analogs: Int, val hitRate: Double, val tests: Int, val years: Double
+    val horizonSec: Long, val patternBars: Int, val barSec: Long,
+    val lossThr: Double, val pUp: Double, val pLoss: Double,
+    val analogs: Int, val hitRate: Double, val tests: Int,
+    val reduced: Boolean, val meta: HistMeta
 )
 
 /**
- * Analogmethode: Das aktuelle Kursmuster (letzte L Tage, normiert) wird mit allen Abschnitten
- * der gesamten Kurshistorie verglichen. Die ähnlichsten Abschnitte (Analoga) zeigen, was danach
- * passiert ist. Daraus entstehen Prozentwerte und der Positiv-/Negativ-Pfad.
- * Ein Rückwärts-Test misst, wie oft die Methode bei diesem Wert die Richtung richtig hatte.
+ * Analogmethode: Das aktuelle Kursmuster wird mit allen Abschnitten der verfügbaren Historie verglichen.
+ * Die ähnlichsten Abschnitte zeigen, was danach passiert ist. Daraus entstehen Prozentwerte und Pfade.
+ * Ein Rückwärts-Test misst, wie oft die Richtung bei diesem Wert gestimmt hätte.
+ * Ist die Tageshistorie kurz, werden Musterlänge und Horizont angepasst; reicht sie gar nicht,
+ * wird auf Stundenkurse ausgewichen.
  */
 object Analog {
     private const val P = 40
@@ -27,7 +32,7 @@ object Analog {
     private const val FRESH_MS = 3_600_000L
 
     private class Entry(val a: Analysis, val ts: Long)
-    private class Hist(val c: DoubleArray, val years: Double, val ts: Long)
+    private class Hist(val c: DoubleArray, val meta: HistMeta, val barSec: Long)
     private class Pred(val up: DoubleArray?, val down: DoubleArray?, val med: DoubleArray?, val pUp: Double, val pLoss: Double, val n: Int)
 
     /** Eigener Thread mit niedriger Priorität: die Rechnung bremst das Scrollen nicht. */
@@ -37,6 +42,7 @@ object Analog {
 
     private val cache = ConcurrentHashMap<String, Entry>()
     private val hist = ConcurrentHashMap<String, Hist>()
+    private val lastMeta = ConcurrentHashMap<String, HistMeta>()
     private val inflight = ConcurrentHashMap.newKeySet<String>()
 
     // (Musterlänge in Tagen, Horizont in Tagen, Schwelle für "Verlust")
@@ -50,6 +56,7 @@ object Analog {
 
     private fun key(s: String, r: Range) = "$s|${r.name}"
     fun cached(sym: String, r: Range): Analysis? = cache[key(sym, r)]?.a
+    fun histMeta(sym: String): HistMeta? = lastMeta[sym]
     fun isFresh(sym: String, r: Range): Boolean =
         cache[key(sym, r)]?.let { System.currentTimeMillis() - it.ts < FRESH_MS } ?: false
 
@@ -62,29 +69,63 @@ object Analog {
         }
     }
 
+    private fun loadHist(sym: String, hourly: Boolean): Hist? {
+        val hk = sym + if (hourly) "|h" else "|d"
+        val now = System.currentTimeMillis()
+        hist[hk]?.let { if (now - it.meta.loadedAt < 6 * FRESH_MS) return it }
+        val s = (if (hourly) Api.chartRaw(sym, "2y", "60m") else Api.history(sym))
+            .points.filter { it.v > 0 }.takeLast(MAX_BARS)
+        if (s.size < 2) return null
+        val h = Hist(
+            DoubleArray(s.size) { s[it].v },
+            HistMeta(s.size, s.first().t, s.last().t, now, hourly),
+            if (hourly) 3600L else 86400L
+        )
+        hist[hk] = h
+        return h
+    }
+
     /** Blockierend: Historie laden, analysieren, Ergebnis eine Stunde zwischenspeichern. */
     fun ensure(sym: String, r: Range, onProgress: (Int) -> Unit = {}): Analysis? {
         val k = key(sym, r)
         val now = System.currentTimeMillis()
         cache[k]?.let { if (now - it.ts < FRESH_MS) return it.a }
         onProgress(0)
-        val h = hist[sym]?.takeIf { now - it.ts < 6 * FRESH_MS } ?: run {
-            val s = Api.history(sym).points.filter { it.v > 0 }.takeLast(MAX_BARS)
-            if (s.size < 2) return null
-            val years = (s.last().t - s.first().t) / 31_557_600.0
-            Hist(DoubleArray(s.size) { s[it].v }, years, now).also { hist[sym] = it }
-        }
+        val daily = loadHist(sym, false)
+        if (daily != null) lastMeta[sym] = daily.meta
         onProgress(10)
-        val a = analyze(h.c, h.years, r, onProgress) ?: return null
+        var a = daily?.let { analyzeWith(it, r, onProgress) }
+        if (a == null) {
+            val hourly = try { loadHist(sym, true) } catch (e: Exception) { null }
+            if (hourly != null) {
+                a = analyzeWith(hourly, r, onProgress)
+                if (a != null || daily == null) lastMeta[sym] = hourly.meta
+            }
+        }
+        if (a == null) return null
         cache[k] = Entry(a, now)
         onProgress(100)
         return a
     }
 
-    private fun analyze(c: DoubleArray, years: Double, r: Range, onProgress: (Int) -> Unit): Analysis? {
-        val (L, H, thr) = cfg(r)
+    private fun analyzeWith(h: Hist, r: Range, onProgress: (Int) -> Unit): Analysis? {
+        val (d0L, d0H, thr) = cfg(r)
+        val mult = if (h.meta.hourly) 24 else 1
+        val l0 = d0L * mult
+        val h0 = d0H * mult
+        val c = h.c
         val m = c.size
-        if (m < L + H + 250) return null
+        var L = l0
+        var H = h0
+        var reduced = false
+        if (m < l0 + h0 + 250) {
+            if (m < 80) return null
+            reduced = true
+            val s = min(1.0, (m - 60.0) / (l0 + h0))
+            L = max(5, (l0 * s).toInt())
+            H = max(1, (h0 * s).toInt())
+            if (m < L + H + 60) return null
+        }
         val lc = DoubleArray(m) { ln(c[it]) }
         val now = m - 1
         val cur = predict(lc, now, L, H, thr, true) ?: return null
@@ -93,7 +134,8 @@ object Analog {
         var tests = 0; var hits = 0; var iter = 0
         val step = max(H, 5)
         var t = now - H
-        val minT = 150 + max(H, L) + L
+        val minCands = min(150, m / 4)
+        val minT = minCands + max(H, L) + L
         val planned = if (t >= minT) min(60, (t - minT) / step + 1) else 1
         while (iter < 60 && t >= minT) {
             iter++
@@ -108,7 +150,10 @@ object Analog {
             t -= step
         }
         val hit = if (tests >= 10) hits.toDouble() / tests else -1.0
-        return Analysis(cur.up!!, cur.down!!, cur.med!!, H, thr, cur.pUp, cur.pLoss, cur.n, hit, tests, years)
+        return Analysis(
+            cur.up!!, cur.down!!, cur.med!!, H * h.barSec, L, h.barSec,
+            thr, cur.pUp, cur.pLoss, cur.n, hit, tests, reduced, h.meta
+        )
     }
 
     private fun znorm(lc: DoubleArray, from: Int, L: Int, out: DoubleArray) {

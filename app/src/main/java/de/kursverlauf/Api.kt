@@ -6,6 +6,7 @@ import java.net.URL
 import java.net.URLEncoder
 
 object Api {
+    const val SOURCE = "Yahoo Finance (finance.yahoo.com)"
     private const val UA = "Mozilla/5.0 (Linux; Android 14) Kursverlauf/1.0"
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 

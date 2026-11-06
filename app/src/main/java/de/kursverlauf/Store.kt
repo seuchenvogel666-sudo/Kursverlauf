@@ -41,8 +41,23 @@ class Store(ctx: Context) {
             sp.edit().putString("watch", a.toString()).apply()
         }
 
+    fun isCollapsed(sym: String): Boolean = (sp.getStringSet("collapsed", emptySet()) ?: emptySet()).contains(sym)
+    fun setCollapsed(sym: String, c: Boolean) {
+        val s = HashSet(sp.getStringSet("collapsed", emptySet()) ?: emptySet())
+        if (c) s.add(sym) else s.remove(sym)
+        sp.edit().putStringSet("collapsed", s).apply()
+    }
+
+    var sectionOrder: List<String>
+        get() = sp.getString("secOrder", null)?.split(",")?.filter { it.isNotBlank() } ?: DEFAULT_ORDER
+        set(v) = sp.edit().putString("secOrder", v.joinToString(",")).apply()
+
     fun widgetSymbol(id: Int): String? = sp.getString("ws_$id", null)
     fun widgetRange(id: Int): Range = runCatching { Range.valueOf(sp.getString("wr_$id", "D1")!!) }.getOrDefault(Range.D1)
     fun setWidget(id: Int, symbol: String, r: Range) { sp.edit().putString("ws_$id", symbol).putString("wr_$id", r.name).apply() }
     fun removeWidget(id: Int) { sp.edit().remove("ws_$id").remove("wr_$id").apply() }
+
+    companion object {
+        val DEFAULT_ORDER = listOf("pattern", "tendency", "recommendation", "updown", "basis", "hit", "range", "loss", "history", "kenn")
+    }
 }
