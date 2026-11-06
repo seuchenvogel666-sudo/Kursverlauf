@@ -54,12 +54,12 @@ object Forecast {
         val days = (meta.to - meta.from) / 86400.0
         val span = if (days >= 365) String.format(Locale.GERMANY, "%.1f Jahre", days / 365.25)
         else String.format(Locale.GERMANY, "%.0f Tage", days)
-        val unit = if (meta.hourly) "Stundenkurse" else "Tageskurse"
+        val unit = meta.unit
         val sb = StringBuilder()
         sb.append("Gelesen am ").append(dtf.format(Date(meta.loadedAt)))
         sb.append(" · Zeitraum ").append(df.format(Date(meta.from * 1000))).append(" bis ").append(df.format(Date(meta.to * 1000)))
         sb.append(String.format(Locale.GERMANY, " (%s, %,d %s)", span, meta.bars, unit))
-        if (meta.hourly) sb.append("\nDie Tageshistorie ist zu kurz, die Basis wurde aus Stundenkursen aufgebaut.")
+        if (meta.fallback) sb.append("\nDie Historie des gewählten Zeitraums war zu kurz, die Basis wurde aus Stundenkursen aufgebaut.")
         if (a != null && a.reduced)
             sb.append("\nKürzere Historie als üblich: Muster (").append(dur(a.patternBars * a.barSec))
                 .append(") und Horizont (").append(dur(a.horizonSec)).append(") wurden angepasst.")
@@ -123,25 +123,26 @@ object Forecast {
         val down = (0..h).map { i -> Point(last.t + span * i / h, last.v * (1 + at(a.downRel, i))) }
         val mid = (0..h).map { i -> Point(last.t + span * i / h, last.v * (1 + at(a.medRel, i))) }
 
-        // Empfehlung: Wahrscheinlichkeit wird bei schwacher Trefferquote Richtung 50 % gezogen
-        val f = if (a.hitRate < 0) 0.5 else ((a.hitRate - 0.5) / 0.08).coerceIn(0.25, 1.0)
-        val signal = 0.5 + (a.pUp - 0.5) * f
+        // Empfehlung: Die Wahrscheinlichkeit ist bereits nach der Trefferquote abgeschwächt (Realitätsprüfung)
+        val signal = a.pUp
         val weakNote = if (a.hitRate < 0.53) " · abgeschwächt wegen geringer Trefferquote" else ""
 
         val pctUp = a.pUp * 100
         val years = (a.meta.to - a.meta.from) / 31_557_600.0
         val yearsTxt = if (years >= 1) String.format(Locale.GERMANY, "%.1f Jahren", years) else String.format(Locale.GERMANY, "%.0f Tagen", years * 365.25)
         val info = listOf(
-            Info("updown", "Steigend / Fallend", String.format(Locale.GERMANY, "%.0f %% / %.0f %% der ähnlichen Verläufe stiegen bzw. fielen danach", pctUp, 100 - pctUp)),
+            Info("updown", "Steigend / Fallend", String.format(Locale.GERMANY,
+                "%.0f %% / %.0f %% (ähnliche Verläufe roh: %.0f %% / %.0f %%, ihr Anteil an der Prognose nach Trefferquote: %.0f %%)",
+                pctUp, 100 - pctUp, a.pUpRaw * 100, 100 - a.pUpRaw * 100, a.blend * 100)),
             Info("basis", "Basis", String.format(Locale.GERMANY, "%d ähnliche Verläufe aus %s Historie, Muster der letzten %s, Horizont %s", a.analogs, yearsTxt, dur(a.patternBars * a.barSec), dur(a.horizonSec))),
             Info("hit", "Trefferquote",
                 if (a.hitRate >= 0)
                     String.format(Locale.GERMANY, "%.0f %% bei diesem Wert (%d Rückwärts-Tests, Zufall wäre 50 %%)", a.hitRate * 100, a.tests)
                 else "Zu wenig Historie für einen Rückwärts-Test"),
-            Info("range", "Spanne am Ende", pc(a.upRel.last()) + " / " + pc(a.downRel.last()) + " (Median " + pc(a.medRel.last()) + ")"),
+            Info("range", "Spanne am Ende", pc(a.upRel.last()) + " / " + pc(a.downRel.last()) + " (Median " + pc(a.medRel.last()) + "), begrenzt durch die aktuelle Schwankung"),
             Info("loss", "Verlustrisiko", String.format(Locale.GERMANY, "Verlust über %.0f %%: %.0f %%", a.lossThr * 100, a.pLoss * 100)),
             Info("history", "Historie", histText(a.meta, a))
         )
-        return Outlook(up, down, tendencyOf(a.pUp), recommendationOf(signal), signal, noteOf(signal, weakNote), info, a.pUp, mid)
+        return Outlook(up, down, tendencyOf(a.pUpRaw), recommendationOf(signal), signal, noteOf(signal, weakNote), info, a.pUp, mid)
     }
 }

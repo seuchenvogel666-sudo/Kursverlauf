@@ -5,6 +5,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
+class LiveQuote(val price: Double, val t: Long)
+
 object Api {
     const val SOURCE = "Yahoo Finance (finance.yahoo.com)"
     private const val UA = "Mozilla/5.0 (Linux; Android 14) Kursverlauf/1.0"
@@ -22,14 +24,28 @@ object Api {
         }
     }
 
-    /** Kursverlauf (Yahoo-Finance-Chart-Schnittstelle, deckt Aktien, ETFs und Krypto ab). */
-    fun chart(symbol: String, r: Range): Series = chartRaw(symbol, r.range, r.interval)
+    /** Kursverlauf für den Anzeigezeitraum: großzügig laden, dann auf das Fenster ab dem letzten Kurs zuschneiden. */
+    fun chart(symbol: String, r: Range): Series {
+        val now = System.currentTimeMillis() / 1000
+        val from = if (r.fetchDays == 0) 0L else now - r.fetchDays * 86400L
+        val s = chartPeriod(symbol, from, now, r.interval)
+        if (r.windowDays == 0 || s.points.isEmpty()) return s
+        val cut = s.points.last().t - r.windowDays * 86400L
+        return Series(s.points.filter { it.t >= cut }, s.currency)
+    }
 
-    /** Tageskurse über die gesamte verfügbare Historie (für die Musteranalyse). */
-    fun history(symbol: String): Series = chartRaw(symbol, "max", "1d")
+    fun chartPeriod(symbol: String, fromSec: Long, toSec: Long, interval: String): Series =
+        parse(get("https://query1.finance.yahoo.com/v8/finance/chart/${enc(symbol)}?period1=$fromSec&period2=$toSec&interval=$interval"))
 
-    fun chartRaw(symbol: String, range: String, interval: String): Series {
-        val j = JSONObject(get("https://query1.finance.yahoo.com/v8/finance/chart/${enc(symbol)}?range=$range&interval=$interval"))
+    /** Aktueller Kurs (klein und schnell, für die 10-Sekunden-Abfrage). */
+    fun quote(symbol: String): LiveQuote {
+        val j = JSONObject(get("https://query1.finance.yahoo.com/v8/finance/chart/${enc(symbol)}?range=1d&interval=1d"))
+        val meta = j.getJSONObject("chart").getJSONArray("result").getJSONObject(0).getJSONObject("meta")
+        return LiveQuote(meta.getDouble("regularMarketPrice"), meta.optLong("regularMarketTime", System.currentTimeMillis() / 1000))
+    }
+
+    private fun parse(text: String): Series {
+        val j = JSONObject(text)
         val res = j.getJSONObject("chart").getJSONArray("result").getJSONObject(0)
         val cur = res.optJSONObject("meta")?.optString("currency", "") ?: ""
         val ts = res.optJSONArray("timestamp") ?: return Series(emptyList(), cur)

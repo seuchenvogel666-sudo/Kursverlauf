@@ -50,7 +50,8 @@ class ChartWidget : AppWidgetProvider() {
         /** Minütliche Aktualisierung (Android darf bei Doze/Energiesparen etwas verzögern). */
         fun schedule(ctx: Context) {
             val am = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            am.setAndAllowWhileIdle(AlarmManager.RTC, System.currentTimeMillis() + 60_000, pi(ctx))
+            val ms = Store(ctx).widgetIntervalMin.coerceAtLeast(1) * 60_000L
+            am.setAndAllowWhileIdle(AlarmManager.RTC, System.currentTimeMillis() + ms, pi(ctx))
         }
         fun cancel(ctx: Context) { (ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(pi(ctx)) }
 
@@ -86,8 +87,9 @@ class ChartWidget : AppWidgetProvider() {
                 fg, withTransparency(bgFull, st.widgetTransp)
             )
             val pts = ser?.points ?: emptyList()
-            val an = Analog.cached(sym, range)
-            if (!Analog.isFresh(sym, range)) Analog.warm(sym, range) { updateOne(ctx, id) }
+            val period = st.analysisPeriod
+            val an = Analog.cached(sym, range, period)
+            if (!Analog.isFresh(sym, range, period)) Analog.warm(sym, range, period) { updateOne(ctx, id) }
             val outlook = (an?.let { Forecast.fromAnalysis(pts, it) }) ?: Forecast.compute(pts)
             val badge = outlook?.pUp?.let { String.format(java.util.Locale.GERMANY, "  ↑%.0f %% ↓%.0f %%", it * 100, (1 - it) * 100) } ?: ""
             var right: String? = null; var rc = fg
@@ -99,7 +101,8 @@ class ChartWidget : AppWidgetProvider() {
             val bmp = Bitmap.createBitmap(wp.toInt().coerceAtLeast(50), hp.toInt().coerceAtLeast(50), Bitmap.Config.ARGB_8888)
             ChartRenderer.draw(
                 Canvas(bmp), bmp.width.toFloat(), bmp.height.toFloat(), d, pts, outlook, col, range,
-                ser?.currency ?: "", title = (watch?.name ?: sym) + badge, right = right, rightColor = rc, bgCorner = 16f * d
+                ser?.currency ?: "", title = (watch?.name ?: sym) + badge, right = right, rightColor = rc, bgCorner = 16f * d,
+                opts = st.opts, levels = if (st.showLevels) LevelFinder.find(pts) else null
             )
             val rv = RemoteViews(ctx.packageName, R.layout.widget_chart)
             rv.setImageViewBitmap(R.id.img, bmp)

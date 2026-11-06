@@ -41,6 +41,18 @@ class Store(ctx: Context) {
             sp.edit().putString("watch", a.toString()).apply()
         }
 
+    var widgetIntervalMin: Int get() = sp.getInt("wInt", 1); set(v) = sp.edit().putInt("wInt", v).apply()
+    var analysisPeriod: AnaPeriod
+        get() = runCatching { AnaPeriod.valueOf(sp.getString("anaP", "MAX")!!) }.getOrDefault(AnaPeriod.MAX)
+        set(v) = sp.edit().putString("anaP", v.name).apply()
+    var showMid: Boolean get() = sp.getBoolean("sMid", true); set(v) = sp.edit().putBoolean("sMid", v).apply()
+    var showUp: Boolean get() = sp.getBoolean("sUp", true); set(v) = sp.edit().putBoolean("sUp", v).apply()
+    var showDown: Boolean get() = sp.getBoolean("sDown", true); set(v) = sp.edit().putBoolean("sDown", v).apply()
+    var showLevels: Boolean get() = sp.getBoolean("sLev", true); set(v) = sp.edit().putBoolean("sLev", v).apply()
+    var showBaseline: Boolean get() = sp.getBoolean("sBase", true); set(v) = sp.edit().putBoolean("sBase", v).apply()
+    var showLegend: Boolean get() = sp.getBoolean("sLeg", true); set(v) = sp.edit().putBoolean("sLeg", v).apply()
+    val opts: ChartOpts get() = ChartOpts(showMid, showUp, showDown, showLevels, showBaseline, showLegend)
+
     fun isCollapsed(sym: String): Boolean = (sp.getStringSet("collapsed", emptySet()) ?: emptySet()).contains(sym)
     fun setCollapsed(sym: String, c: Boolean) {
         val s = HashSet(sp.getStringSet("collapsed", emptySet()) ?: emptySet())

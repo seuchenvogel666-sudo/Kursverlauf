@@ -6,12 +6,17 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -24,29 +29,31 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInWindow
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.zIndex
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.min
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -71,6 +78,11 @@ fun App(store: Store) {
     var wTr by remember { mutableStateOf(store.widgetTransp) }
     var range by remember { mutableStateOf(store.range) }
     var picker by remember { mutableStateOf<PickerReq?>(null) }
+    var prefsN by remember { mutableStateOf(0) }
+    var restartN by remember { mutableStateOf(0) }
+    var resetN by remember { mutableStateOf(0) }
+    val opts = remember(prefsN) { store.opts }
+    val anaPeriod = remember(prefsN) { store.analysisPeriod }
 
     val fg = textColorFor(appBg)
     val dark = fg == WHITE
@@ -84,8 +96,8 @@ fun App(store: Store) {
             Box(Modifier.fillMaxSize().background(Color(withTransparency(appBg, appTr))).systemBarsPadding().padding(horizontal = 12.dp)) {
                 when (screen) {
                     Screen.HOME -> Home(
-                        watch, range, 
-                        onRange = { range = it; store.range = it },
+                        watch, range, opts, anaPeriod, restartN, resetN,
+                        onRange = { range = it; store.range = it; resetN++ },
                         onSearch = { screen = Screen.SEARCH },
                         onSettings = { screen = Screen.SETTINGS },
                         onRemove = { w -> saveWatch(watch.filter { it.symbol != w.symbol }) },
@@ -95,7 +107,7 @@ fun App(store: Store) {
                         if (watch.none { it.symbol == q.symbol }) saveWatch(watch + Watch(q.symbol, q.name))
                     }
                     Screen.SETTINGS -> Settings(
-                        appBg, appTr, wBg, wTr,
+                        appBg, appTr, wBg, wTr, store,
                         onAppTr = { appTr = it; store.appTransp = it },
                         onWTr = { wTr = it; store.widgetTransp = it },
                         pick = { picker = it },
@@ -105,6 +117,8 @@ fun App(store: Store) {
                             appBg = Pal.BG; store.appBg = Pal.BG; appTr = 0; store.appTransp = 0
                             wBg = Pal.BG; store.widgetBg = Pal.BG; wTr = 15; store.widgetTransp = 15
                         },
+                        onPrefs = { prefsN++; ChartWidget.schedule(ctx) },
+                        onRestartAnalysis = { Analog.clearAll(); restartN++; ChartWidget.refreshAll(ctx) },
                         onBack = { closeSettings() }
                     )
                 }
@@ -137,9 +151,31 @@ class DragCtl {
     var onScrolled: (Float) -> Unit = {}
 }
 
+/** Zwei-Finger-Geste: Zoomen und Verschieben. Ein Finger bleibt für Scrollen, Tippen und langes Drücken frei. */
+suspend fun PointerInputScope.twoFingerTransform(onTransform: (Float, Float, Float) -> Unit, onEnd: () -> Unit) {
+    awaitEachGesture {
+        awaitFirstDown(requireUnconsumed = false)
+        var used = false
+        do {
+            val event = awaitPointerEvent()
+            if (event.changes.count { it.pressed } >= 2) {
+                val zoom = event.calculateZoom()
+                val pan = event.calculatePan()
+                val centroid = event.calculateCentroid(useCurrent = true)
+                if (zoom != 1f || pan.x != 0f) {
+                    onTransform(centroid.x / size.width, zoom, pan.x / size.width)
+                    used = true
+                }
+                event.changes.forEach { if (it.positionChanged()) it.consume() }
+            }
+        } while (event.changes.any { it.pressed })
+        if (used) onEnd()
+    }
+}
+
 @Composable
 fun Home(
-    watch: List<Watch>, range: Range,
+    watch: List<Watch>, range: Range, opts: ChartOpts, anaPeriod: AnaPeriod, restartN: Int, resetN: Int,
     onRange: (Range) -> Unit, onSearch: () -> Unit, onSettings: () -> Unit,
     onRemove: (Watch) -> Unit, onMove: (Int, Int) -> Unit
 ) {
@@ -217,7 +253,7 @@ fun Home(
                                 .onSizeChanged { heights[w.symbol] = it.height }
                         ) {
                             ChartCard(
-                                w, range, secOrder,
+                                w, range, opts, anaPeriod, restartN, resetN, secOrder,
                                 onReorder = { disp ->
                                     val full = (secOrder + disp.filter { it !in secOrder }).toMutableList()
                                     val slots = full.indices.filter { full[it] in disp }
@@ -254,12 +290,19 @@ fun signalColor(s: Double): Color {
     return if (x < 0.5f) lerp(red, yellow, x * 2f) else lerp(yellow, green, (x - 0.5f) * 2f)
 }
 
-/** Eigene Komposition, damit nur dieser Teil bei Fortschrittsänderungen neu gezeichnet wird. */
+/** Fortschritt mit Restzeit. Eigene Komposition, damit nur dieser Teil neu gezeichnet wird. */
 @Composable
-fun AnalysisProgress(progress: () -> Int) {
+fun AnalysisProgress(progress: () -> Int, startMs: () -> Long) {
     val p = progress()
-    Column(Modifier.padding(top = 10.dp)) {
-        Text("Muster-Analyse der Historie läuft … $p %", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+    val elapsed = (System.currentTimeMillis() - startMs()).coerceAtLeast(0L) / 1000.0
+    val eta = if (p in 3..99) elapsed * (100 - p) / p else -1.0
+    val etaTxt = when {
+        eta < 0 -> "Restzeit wird geschätzt …"
+        eta < 90 -> String.format(Locale.GERMANY, "noch ca. %.0f s", eta)
+        else -> String.format(Locale.GERMANY, "noch ca. %.0f Min", eta / 60)
+    }
+    Column(Modifier.padding(top = 6.dp)) {
+        Text("Musteranalyse läuft: $p % · $etaTxt", fontWeight = FontWeight.Bold, fontSize = 12.sp)
         LinearProgressIndicator(
             progress = { p / 100f },
             modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
@@ -269,11 +312,26 @@ fun AnalysisProgress(progress: () -> Int) {
 }
 
 /** Zwischenspeicher: beim Zurückkehren erscheinen die Daten sofort, nichts springt. */
-object Live { val series = HashMap<String, Series>() }
+object Live {
+    val series = HashMap<String, Series>()
+    val quotes = HashMap<String, LiveQuote>()
+}
+
+/** Den aktuellen Kurs als letzten Punkt in den Verlauf einsetzen. */
+fun applyLive(base: List<Point>, q: LiveQuote?): List<Point> {
+    if (q == null || base.isEmpty()) return base
+    val last = base.last()
+    return when {
+        q.t > last.t -> base + Point(q.t, q.price)
+        q.t == last.t -> base.dropLast(1) + Point(last.t, q.price)
+        else -> base
+    }
+}
 
 @Composable
 fun ChartCard(
-    w: Watch, range: Range, order: List<String>, onReorder: (List<String>) -> Unit, ctl: DragCtl,
+    w: Watch, range: Range, opts: ChartOpts, anaPeriod: AnaPeriod, restartN: Int, resetN: Int,
+    order: List<String>, onReorder: (List<String>) -> Unit, ctl: DragCtl,
     onCardDragStart: (Float) -> Unit, onCardDrag: (Float) -> Unit, onCardDragEnd: () -> Unit,
     onRemove: () -> Unit
 ) {
@@ -281,28 +339,38 @@ fun ChartCard(
     val store = remember { Store(ctx) }
     val density = LocalDensity.current.density
     val ck = w.symbol + "|" + range.name
+    val ak = ck + "|" + anaPeriod.name + "|" + restartN
     var collapsed by remember(w.symbol) { mutableStateOf(store.isCollapsed(w.symbol)) }
     var series by remember(ck) { mutableStateOf(Live.series[ck]) }
     var err by remember(ck) { mutableStateOf<String?>(null) }
     var stamp by remember(ck) { mutableStateOf(0L) }
-    var analysis by remember(ck) { mutableStateOf(Analog.cached(w.symbol, range)) }
-    var meta by remember(ck) { mutableStateOf(Analog.histMeta(w.symbol)) }
-    var progress by remember(ck) { mutableStateOf(0) }
-    var tried by remember(ck) { mutableStateOf(Analog.cached(w.symbol, range) != null) }
+    var live by remember(w.symbol) { mutableStateOf(Live.quotes[w.symbol]) }
+    var analysis by remember(ak) { mutableStateOf(Analog.cached(w.symbol, range, anaPeriod)) }
+    var meta by remember(ak) { mutableStateOf(Analog.histMeta(w.symbol, anaPeriod)) }
+    var progress by remember(ak) { mutableStateOf(0) }
+    var running by remember(ak) { mutableStateOf(false) }
+    var startMs by remember(ak) { mutableStateOf(0L) }
+    var tried by remember(ak) { mutableStateOf(Analog.cached(w.symbol, range, anaPeriod) != null) }
+    var failReason by remember(ak) { mutableStateOf<String?>(null) }
+    var viewFrom by remember(ck, resetN) { mutableStateOf(0f) }
+    var viewTo by remember(ck, resetN) { mutableStateOf(1f) }
 
-    LaunchedEffect(ck) {
-        // Analyse läuft getrennt, damit die minütliche Kursaktualisierung nie darauf wartet
-        launch {
-            while (true) {
-                try {
-                    val a = withContext(Analog.dispatcher) { Analog.ensure(w.symbol, range) { p -> progress = p } }
-                    if (a != null) analysis = a
-                } catch (e: Exception) { }
-                meta = Analog.histMeta(w.symbol)
-                tried = true
-                delay(60_000)
+    // Aktueller Kurs alle 10 Sekunden (bei Fehlern mit Pause, damit der Dienst nicht überlastet wird)
+    LaunchedEffect(w.symbol) {
+        var failures = 0
+        while (true) {
+            try {
+                val q = withContext(Dispatchers.IO) { Api.quote(w.symbol) }
+                Live.quotes[w.symbol] = q; live = q; failures = 0
+                delay(10_000)
+            } catch (e: Exception) {
+                failures++
+                delay(min(60_000L, 10_000L * (1L shl min(failures, 3))))
             }
         }
+    }
+    // Verlauf für den gewählten Zeitraum jede Minute
+    LaunchedEffect(ck) {
         while (true) {
             val t0 = System.currentTimeMillis()
             try {
@@ -313,10 +381,31 @@ fun ChartCard(
             delay((60_000 - (System.currentTimeMillis() - t0)).coerceAtLeast(1_000))
         }
     }
+    // Musteranalyse getrennt davon (rechnet im Hintergrund, Ergebnis eine Stunde gültig)
+    LaunchedEffect(ak) {
+        while (true) {
+            try {
+                val a = withContext(Analog.dispatcher) {
+                    Analog.ensure(w.symbol, range, anaPeriod) { p ->
+                        if (p == 0) { startMs = System.currentTimeMillis(); running = true }
+                        progress = p
+                    }
+                }
+                if (a != null) analysis = a
+            } catch (e: Exception) { }
+            running = false
+            meta = Analog.histMeta(w.symbol, anaPeriod)
+            failReason = Analog.reason(w.symbol, range, anaPeriod)
+            tried = true
+            delay(60_000)
+        }
+    }
 
-    val pts = remember(series) { series?.points ?: emptyList() }
-    val outlook = remember(series, analysis) { analysis?.let { Forecast.fromAnalysis(pts, it) } ?: Forecast.compute(pts) }
-    val pattern = remember(series) { Patterns.detect(pts) }
+    val basePts = remember(series) { series?.points ?: emptyList() }
+    val pts = remember(basePts, live) { applyLive(basePts, live) }
+    val outlook = remember(pts, analysis) { analysis?.let { Forecast.fromAnalysis(pts, it) } ?: Forecast.compute(pts) }
+    val pattern = remember(basePts) { Patterns.detect(basePts) }
+    val levels = remember(pts) { LevelFinder.find(pts) }
     val col = ChartColors(Pal.PRICE, Pal.UP, Pal.DOWN, WHITE, 0)
     val chg = if (pts.size >= 2) pts.last().v / pts.first().v - 1 else 0.0
     val nameColor = if (collapsed && outlook != null) signalColor(outlook.signal) else Color(WHITE)
@@ -353,11 +442,20 @@ fun ChartCard(
             }
             Text(outlook.signalNote, fontSize = 11.sp)
         })
-        outlook.info.forEach { inf -> secs.add(SecDef(inf.id, inf.heading) { Text(inf.text, fontSize = 12.sp) }) }
+        outlook.info.forEach { inf ->
+            secs.add(SecDef(inf.id, inf.heading) {
+                Text(inf.text, fontSize = 12.sp)
+                if (inf.id == "basis" && running) AnalysisProgress({ progress }, { startMs })
+            })
+        }
     }
     val mt = meta
-    if (analysis == null && tried && mt != null)
-        secs.add(SecDef("history", "Historie") { Text(Forecast.histText(mt, null), fontSize = 12.sp) })
+    val fr = failReason
+    if (analysis == null && tried && !running)
+        secs.add(SecDef("history", "Historie und Analyse") {
+            if (fr != null) Text("Musteranalyse nicht möglich: $fr", fontSize = 12.sp)
+            if (mt != null) Text(Forecast.histText(mt, null), fontSize = 12.sp)
+        })
     val displayed = secs.sortedBy { val ix = order.indexOf(it.id); if (ix < 0) 999 else ix }
     val curIds by rememberUpdatedState(displayed.map { it.id })
 
@@ -412,28 +510,53 @@ fun ChartCard(
                 }
                 if (pts.size >= 2) Column(horizontalAlignment = Alignment.End) {
                     Text(ChartRenderer.fmt(pts.last().v) + " " + (series?.currency ?: ""), fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                    Text(String.format(Locale.GERMANY, "%+.2f %%", chg * 100), color = Color(if (chg >= 0) Pal.UP else Pal.DOWN), fontSize = 13.sp)
+                    Text(
+                        String.format(Locale.GERMANY, "%+.2f %% (%s)", chg * 100, range.label),
+                        color = Color(if (chg >= 0) Pal.UP else Pal.DOWN), fontSize = 13.sp
+                    )
                 }
             }
             Spacer(Modifier.height(8.dp))
             if (series == null) {
                 Box(Modifier.fillMaxWidth().height(240.dp), contentAlignment = Alignment.Center) { Text(err ?: "Lade Daten …") }
             } else {
-                Canvas(Modifier.fillMaxWidth().height(240.dp)) {
-                    drawIntoCanvas { ChartRenderer.draw(it.nativeCanvas, size.width, size.height, density, pts, outlook, col, range, series?.currency ?: "") }
+                Canvas(
+                    Modifier.fillMaxWidth().height(240.dp).pointerInput(ck, resetN) {
+                        twoFingerTransform(
+                            onTransform = { cx, zoom, panX ->
+                                val span = viewTo - viewFrom
+                                val c = cx.coerceIn(0f, 1f)
+                                val ns = (span / zoom).coerceIn(0.02f, 1f)
+                                val anchor = viewFrom + c * span
+                                val nf = (anchor - c * ns - panX * ns).coerceIn(0f, 1f - ns)
+                                viewFrom = nf; viewTo = nf + ns
+                            },
+                            onEnd = { ctl.lastEnd = System.currentTimeMillis() }
+                        )
+                    }
+                ) {
+                    drawIntoCanvas {
+                        ChartRenderer.draw(
+                            it.nativeCanvas, size.width, size.height, density, pts, outlook, col, range, series?.currency ?: "",
+                            opts = opts, levels = if (opts.levels) levels else null, viewFrom = viewFrom, viewTo = viewTo
+                        )
+                    }
                 }
             }
         }
 
         if (!collapsed) {
-            Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) { Legend("Verlauf", Pal.PRICE); Legend("Erwarteter Verlauf (gestrichelt)", Pal.MID) }
-                Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) { Legend("Positiv-Szenario", Pal.UP); Legend("Negativ-Szenario", Pal.DOWN) }
-            }
-
-            if (series != null && analysis == null) {
-                if (!tried) AnalysisProgress { progress }
-                else Text("Für die Musteranalyse reicht die Historie nicht, es wird eine einfache Schätzung angezeigt.", fontSize = 11.sp, modifier = Modifier.padding(top = 8.dp))
+            val leg = ArrayList<Pair<String, Int>>()
+            leg.add("Verlauf" to Pal.PRICE)
+            if (opts.mid) leg.add("Erwarteter Verlauf (gestrichelt)" to Pal.MID)
+            if (opts.up) leg.add("Positiv-Szenario" to Pal.UP)
+            if (opts.down) leg.add("Negativ-Szenario" to Pal.DOWN)
+            if (opts.levels) leg.add("Unterstützung/Widerstand" to WHITE)
+            if (opts.baseline) leg.add("Ausgangspunkt (grau)" to 0xFF9E9E9E.toInt())
+            if (opts.legend) Column(Modifier.padding(top = 6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                leg.chunked(2).forEach { row ->
+                    Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) { row.forEach { Legend(it.first, it.second) } }
+                }
             }
 
             displayed.forEach { s ->
@@ -567,18 +690,63 @@ fun Swatch(color: Int, label: String, onClick: () -> Unit) {
 }
 
 @Composable
+fun SwitchRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, modifier = Modifier.weight(1f), fontSize = 14.sp)
+        Switch(checked = checked, onCheckedChange = onChange)
+    }
+}
+
+@Composable
 fun Settings(
-    appBg: Int, appTr: Int, wBg: Int, wTr: Int,
+    appBg: Int, appTr: Int, wBg: Int, wTr: Int, store: Store,
     onAppTr: (Int) -> Unit, onWTr: (Int) -> Unit,
     pick: (PickerReq) -> Unit, onAppBg: (Int) -> Unit, onWBg: (Int) -> Unit,
-    onReset: () -> Unit, onBack: () -> Unit
+    onReset: () -> Unit, onPrefs: () -> Unit, onRestartAnalysis: () -> Unit, onBack: () -> Unit
 ) {
+    var showMid by remember { mutableStateOf(store.showMid) }
+    var showUp by remember { mutableStateOf(store.showUp) }
+    var showDown by remember { mutableStateOf(store.showDown) }
+    var showLev by remember { mutableStateOf(store.showLevels) }
+    var showBase by remember { mutableStateOf(store.showBaseline) }
+    var showLeg by remember { mutableStateOf(store.showLegend) }
+    var period by remember { mutableStateOf(store.analysisPeriod) }
+    var wInt by remember { mutableStateOf(store.widgetIntervalMin) }
+    var restarted by remember { mutableStateOf(false) }
+
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 8.dp)) {
             TextButton(onClick = onBack) { Text("← Zurück") }
             Text("Einstellungen", fontWeight = FontWeight.Bold, fontSize = 18.sp)
         }
-        Text("App-Hintergrund", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+
+        Text("Hilfsgraphen im Diagramm", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp))
+        SwitchRow("Erwarteter Verlauf (gelb, gestrichelt)", showMid) { showMid = it; store.showMid = it; onPrefs() }
+        SwitchRow("Positiv-Szenario (grün)", showUp) { showUp = it; store.showUp = it; onPrefs() }
+        SwitchRow("Negativ-Szenario (rot)", showDown) { showDown = it; store.showDown = it; onPrefs() }
+        SwitchRow("Unterstützung und Widerstand (weiß)", showLev) { showLev = it; store.showLevels = it; onPrefs() }
+        SwitchRow("Ausgangspunkt des Zeitraums (grau)", showBase) { showBase = it; store.showBaseline = it; onPrefs() }
+        SwitchRow("Legende unter dem Graphen", showLeg) { showLeg = it; store.showLegend = it; onPrefs() }
+
+        Text("Musteranalyse", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 16.dp))
+        Text("Historie, aus der die Analyse lernt:", fontSize = 13.sp)
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            AnaPeriod.values().forEach { p -> Chip(p.label, p == period) { period = p; store.analysisPeriod = p; onPrefs() } }
+        }
+        Text("Kürzere Zeiträume nutzen feinere Kurse (Stunden-, Minutenkurse). Beim Wechsel startet die Analyse neu.", fontSize = 11.sp)
+        Button(onClick = { onRestartAnalysis(); restarted = true }, modifier = Modifier.padding(top = 8.dp)) { Text("Musteranalyse neu starten") }
+        if (restarted) Text("Analyse wurde neu gestartet, der Fortschritt steht unter „Basis“.", fontSize = 12.sp)
+
+        Text("Widget", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 16.dp))
+        Text("Aktualisierung alle:", fontSize = 13.sp)
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(1, 2, 5, 10, 15, 30, 60).forEach { m ->
+                Chip(if (m == 60) "1 Std" else "$m Min", m == wInt) { wInt = m; store.widgetIntervalMin = m; onPrefs() }
+            }
+        }
+        Text("Android kann Aktualisierungen bei aktivem Energiesparen verzögern.", fontSize = 11.sp)
+
+        Text("App-Hintergrund", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 16.dp))
         Swatch(appBg, "Farbe wählen") { pick(PickerReq("App-Hintergrund", appBg, onAppBg)) }
         Text("Durchsichtigkeit: $appTr %  (0 = deckend, 100 = durchsichtig)", fontSize = 13.sp)
         Slider(appTr.toFloat(), { onAppTr(it.toInt()) }, valueRange = 0f..100f)
