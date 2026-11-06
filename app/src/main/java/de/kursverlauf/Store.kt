@@ -21,35 +21,23 @@ fun textColorFor(bg: Int): Int {
 class Store(ctx: Context) {
     private val sp = ctx.applicationContext.getSharedPreferences("kv", Context.MODE_PRIVATE)
 
-    var themeIdx: Int get() = sp.getInt("theme", 0); set(v) = sp.edit().putInt("theme", v).apply()
-    var appBg: Int get() = sp.getInt("appBg", Themes.all[0].bg); set(v) = sp.edit().putInt("appBg", v).apply()
+    var appBg: Int get() = sp.getInt("appBg", Pal.BG); set(v) = sp.edit().putInt("appBg", v).apply()
     var appTransp: Int get() = sp.getInt("appTr", 0); set(v) = sp.edit().putInt("appTr", v).apply()
-    var widgetBg: Int get() = sp.getInt("wBg", Themes.all[0].bg); set(v) = sp.edit().putInt("wBg", v).apply()
+    var widgetBg: Int get() = sp.getInt("wBg", Pal.BG); set(v) = sp.edit().putInt("wBg", v).apply()
     var widgetTransp: Int get() = sp.getInt("wTr", 15); set(v) = sp.edit().putInt("wTr", v).apply()
     var range: Range
         get() = runCatching { Range.valueOf(sp.getString("range", "D1")!!) }.getOrDefault(Range.D1)
         set(v) = sp.edit().putString("range", v.name).apply()
 
-    fun newWatch(q: Quote): Watch {
-        val t = Themes.all[themeIdx]
-        return Watch(q.symbol, q.name, t.price, t.up, t.down)
-    }
-
     var watch: List<Watch>
         get() {
-            val s = sp.getString("watch", null) ?: return listOf(
-                newWatch(Quote("BTC-USD", "Bitcoin", "Krypto")),
-                newWatch(Quote("AAPL", "Apple Inc.", "Aktie"))
-            )
+            val s = sp.getString("watch", null) ?: return listOf(Watch("BTC-USD", "Bitcoin"), Watch("AAPL", "Apple Inc."))
             val a = JSONArray(s)
-            return (0 until a.length()).map {
-                val o = a.getJSONObject(it)
-                Watch(o.getString("s"), o.getString("n"), o.getInt("p"), o.getInt("u"), o.getInt("d"))
-            }
+            return (0 until a.length()).map { val o = a.getJSONObject(it); Watch(o.getString("s"), o.getString("n")) }
         }
         set(l) {
             val a = JSONArray()
-            l.forEach { a.put(JSONObject().put("s", it.symbol).put("n", it.name).put("p", it.price).put("u", it.up).put("d", it.down)) }
+            l.forEach { a.put(JSONObject().put("s", it.symbol).put("n", it.name)) }
             sp.edit().putString("watch", a.toString()).apply()
         }
 

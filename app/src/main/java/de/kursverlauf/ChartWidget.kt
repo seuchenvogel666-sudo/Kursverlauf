@@ -72,7 +72,6 @@ class ChartWidget : AppWidgetProvider() {
             val range = st.widgetRange(id)
             val ser = runCatching { Api.chart(sym, range) }.getOrNull()
             val watch = st.watch.find { it.symbol == sym }
-            val th = Themes.all[st.themeIdx]
             val opts = mgr.getAppWidgetOptions(id)
             var d = ctx.resources.displayMetrics.density
             var wp = (opts.getInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH, 250) * d)
@@ -83,7 +82,7 @@ class ChartWidget : AppWidgetProvider() {
             val bgFull = st.widgetBg
             val fg = textColorFor(bgFull)
             val col = ChartColors(
-                watch?.price ?: th.price, watch?.up ?: th.up, watch?.down ?: th.down,
+                Pal.PRICE, Pal.UP, Pal.DOWN,
                 fg, withTransparency(bgFull, st.widgetTransp)
             )
             val pts = ser?.points ?: emptyList()
